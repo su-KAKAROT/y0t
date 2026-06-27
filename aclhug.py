@@ -1,6 +1,3 @@
-                      
-
-
 import argparse
 import sys
 import struct
@@ -59,9 +56,31 @@ EXTENDED_RIGHT_GUIDS = {
     "68b1d179-0d15-4d4f-ab71-46152e79a7bc": "AllowedToAuthenticate",
     "9923a32a-3607-11d2-b9be-0000f87a36b2": "DS-Install-Replica",
     "cc17b1fb-33d9-11d2-97d4-00c04fd8d5cd": "User-Account-Restrictions",
-    "e48d0154-bcf8-11d1-8702-00c04fb96050": "ReadLAPSPassword",
-    "5805bc62-bdc9-4428-a5e2-856a0f4c185e": "ReadLAPSPassword-New",
+                                                                                
+                                                                               
+                                                                          
+                                                                              
+                                                                                
 }
+
+                                                                                
+                                                                       
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+WLAPS_PASSWORD_GUID           = "a6b34bd9-9e1c-4a43-9a6c-2d9a7f9e6a19"            
+WLAPS_ENCRYPTEDPASSWORD_GUID  = "60f5b8f8-aa0c-43ef-b3c4-16e0d9a39c28"             
+
+                                                                                
+                                                                          
+                                                                                
+LAPS_SECRET_LDAP_NAMES = [
+    "ms-Mcs-AdmPwd",                  
+    "msLAPS-Password",                
+    "msLAPS-EncryptedPassword",       
+]
 
                                                                           
                                                                           
@@ -326,10 +345,26 @@ ATTACK_TECHNIQUES = {
         "attack_vector": "Requires knowing the current password; limited to credential-in-hand scenarios.",
     },
     "ReadLAPSPassword": {
-        "technique": "Read LAPS managed password for computer account",
+        "technique": "Read LAPS managed password (legacy ms-Mcs-AdmPwd or Windows LAPS msLAPS-Password / msLAPS-EncryptedPassword) for a computer account",
         "severity":  "HIGH",
         "methods":   ["read-laps-password → local-admin-access"],
-        "attack_vector": "Read the LAPS-managed local admin password directly from the computer object.",
+        "attack_vector": (
+            "Read the LAPS-managed local admin password directly from the computer object "
+            "(e.g. via Get-AdmPwdPassword, pyLAPS.py, bloodyAD, or a plain LDAP read of the "
+            "relevant attribute) — grants immediate local Administrator access to that host."
+        ),
+    },
+    "ReadGMSAPassword": {
+        "technique": "Read GMSA managed password via PrincipalsAllowedToRetrieveManagedPassword (msDS-GroupMSAMembership)",
+        "severity":  "HIGH",
+        "methods":   ["read-gmsa-password → compute-NTLM-hash → authenticate-as-service-account"],
+        "attack_vector": (
+            "Principal is explicitly listed as allowed to retrieve the managed password for this "
+            "gMSA (security descriptor stored inside msDS-GroupMSAMembership, exposed as "
+            "PrincipalsAllowedToRetrieveManagedPassword). Query msDS-ManagedPassword directly "
+            "(e.g. gMSADumper.py, NetExec, bloodyAD) to derive the current NTLM hash and "
+            "authenticate as the service account."
+        ),
     },
     "WriteSupportedEncTypes": {
         "technique": "Write msDS-SupportedEncryptionTypes — downgrade Kerberos encryption",
@@ -369,6 +404,7 @@ SEVERITY = {
     "WriteUserParams":                            "HIGH",
     "WriteAllowedToDelegateTo":                   "HIGH",
     "ReadLAPSPassword":                           "HIGH",
+    "ReadGMSAPassword":                           "HIGH",
     "SetPrimaryGroup":                            "HIGH",                                        
     "WriteSupportedEncTypes":                     "MEDIUM",
     "WriteProperty":                              "MEDIUM",
@@ -611,6 +647,60 @@ def ldap_connect(dc_ip: str, domain: str, username: str, password: str) -> Conne
         authentication=NTLM,
         auto_bind=True,
     )
+
+
+                                                                                
+                                                            
+                                                                                
+def resolve_schema_guids(conn, ldap_names: list) -> dict:
+    
+    result = {}
+    try:
+        schema_dn = None
+        try:
+            other = conn.server.info.other or {}
+            vals  = other.get("schemaNamingContext") or []
+            schema_dn = vals[0] if vals else None
+        except Exception:
+            schema_dn = None
+        if not schema_dn:
+            return result
+        name_clauses = "".join(f"(lDAPDisplayName={n})" for n in ldap_names)
+        conn.search(
+            search_base=schema_dn,
+            search_filter=f"(|{name_clauses})",
+            search_scope=SUBTREE,
+            attributes=["lDAPDisplayName", "schemaIDGUID"],
+        )
+        for e in conn.entries:
+            try:
+                nm      = str(e["lDAPDisplayName"].value).lower()
+                raw_val = e["schemaIDGUID"].raw_values[0]
+                guid    = format_guid(raw_val)
+                if guid:
+                    result[nm] = guid.lower()
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return result
+
+
+def build_laps_read_guids(conn) -> dict:
+    
+    guid_map = {}
+                                                                             
+                                                                           
+                                                                              
+    guid_map[WLAPS_PASSWORD_GUID.lower()]          = "ReadLAPSPassword"
+    guid_map[WLAPS_ENCRYPTEDPASSWORD_GUID.lower()] = "ReadLAPSPassword"
+    try:
+        dynamic = resolve_schema_guids(conn, LAPS_SECRET_LDAP_NAMES)
+        for guid in dynamic.values():
+            guid_map[guid] = "ReadLAPSPassword"
+    except Exception:
+        pass
+    return guid_map
 
 
 def paged_search_all(conn, base_dn: str, search_filter: str,
@@ -886,7 +976,7 @@ def parse_aces(sd_bytes: bytes) -> list:
                                                    
                                                                                 
 def check_rights(access_mask: int, guid: str | None,
-                 include_all: bool = False) -> list:
+                 include_all: bool = False, read_guids: dict | None = None) -> list:
     
     found = []
 
@@ -917,12 +1007,17 @@ def check_rights(access_mask: int, guid: str | None,
             found.append("WriteAllProperties")
 
                                                                            
+                                                                                  
+                                                                                
     if access_mask & 0x00000100:
         if guid:
             g    = guid.lower()
             name = EXTENDED_RIGHT_GUIDS.get(g)
+            if not name and read_guids:
+                name = read_guids.get(g)
             if name:
-                found.append(name)
+                if name not in found:
+                    found.append(name)
             elif include_all:
                 found.append(f"ExtendedRight({guid})")
         else:
@@ -942,6 +1037,15 @@ def check_rights(access_mask: int, guid: str | None,
             else:
                                                                             
                 found.append("WriteProperty")
+
+                                                                                    
+                                                                                  
+                                                                                
+    if (access_mask & 0x00000010) and guid and read_guids:
+        g    = guid.lower()
+        name = read_guids.get(g)
+        if name and name not in found:
+            found.append(name)
 
                                                                             
     if include_all and (access_mask & 0x00000008) and "GenericWrite" not in found:
@@ -987,12 +1091,26 @@ def hunt_acls(conn, domain_dn: str, target_sid: str,
               skip_inherited: bool = False,
               page_size: int = 500) -> list:
     print(f"\n{Fore.CYAN}[*] Paged ACL scan (page_size={page_size})...{Style.RESET_ALL}")
-    sd_ctrl     = security_descriptor_control(sdflags=0x04)
+    sd_ctrl = security_descriptor_control(sdflags=0x04)
+
+                                                                             
+                                                                              
+                                                                             
+    print(f"{Fore.CYAN}[*] Resolving LAPS attribute schemaIDGUIDs (forest-specific)...{Style.RESET_ALL}")
+    laps_read_guids = build_laps_read_guids(conn)
+    if laps_read_guids:
+        print(f"{Fore.GREEN}[+] LAPS secret attribute GUID(s) resolved: "
+              f"{len(set(laps_read_guids.keys()))}{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.YELLOW}[!] No LAPS attributes found in schema "
+              f"(legacy/Windows LAPS not deployed in this forest){Style.RESET_ALL}")
+
     all_entries = paged_search_all(
         conn, domain_dn,
         search_filter="(objectClass=*)",
         attributes=["nTSecurityDescriptor", "distinguishedName",
-                    "objectClass", "name", "sAMAccountName"],
+                    "objectClass", "name", "sAMAccountName",
+                    "msDS-GroupMSAMembership"],
         page_size=page_size,
         extra_controls=sd_ctrl,
     )
@@ -1002,49 +1120,91 @@ def hunt_acls(conn, domain_dn: str, target_sid: str,
     for i, entry in enumerate(all_entries):
         try:
             raw_sd_list = entry.get("raw_attributes", {}).get("nTSecurityDescriptor", [])
-            if not raw_sd_list:
-                continue
-            raw_sd   = raw_sd_list[0]
-            obj_dn   = entry.get("dn", "")
-            aces     = parse_aces(raw_sd)
+            obj_dn      = entry.get("dn", "")
             obj_name, obj_class = entry_summary(entry)
-            for ace in aces:
-                if ace["trustee"] != target_sid:
-                    continue
-                if skip_inherited and ace["inherited"]:
-                    continue
-                ace_type  = ace.get("type")
-                rights_vb = decode_rights_verbose(ace["access_mask"], ace["guid"])
-                if include_all:
-                    rights = check_rights(ace["access_mask"], ace["guid"], include_all=True)
-                    if not rights:
-                        rights = [f"0x{ace['access_mask']:08X}"]
-                else:
-                    if ace_type not in (0x00, 0x05):
+
+                                                                             
+                                                                
+                                                                             
+            if raw_sd_list:
+                raw_sd = raw_sd_list[0]
+                aces   = parse_aces(raw_sd)
+                for ace in aces:
+                    if ace["trustee"] != target_sid:
                         continue
-                    rights = check_rights(ace["access_mask"], ace["guid"])
-                    if not rights:
+                    if skip_inherited and ace["inherited"]:
                         continue
-                for right in rights:
-                    technique = ATTACK_TECHNIQUES.get(right, {})
-                    severity  = SEVERITY.get(right, "LOW")
-                    results.append({
-                        "right":          right,
-                        "severity":       severity,
-                        "technique":      technique.get("technique", right),
-                        "methods":        technique.get("methods", []),
-                        "attack_vector":  technique.get("attack_vector", ""),
-                        "ace_type":       ace_type,
-                        "ace_type_name":  ACE_TYPE_NAMES.get(ace_type, f"0x{ace_type:02x}"),
-                        "object_name":    obj_name,
-                        "object_dn":      obj_dn,
-                        "object_class":   obj_class,
-                        "access_mask":    ace["access_mask"],
-                        "guid":           ace["guid"],
-                        "inherited":      ace["inherited"],
-                        "verbose_rights": rights_vb,
-                        "trustee":        ace["trustee"],
-                    })
+                    ace_type  = ace.get("type")
+                    rights_vb = decode_rights_verbose(ace["access_mask"], ace["guid"])
+                    if include_all:
+                        rights = check_rights(ace["access_mask"], ace["guid"],
+                                              include_all=True, read_guids=laps_read_guids)
+                        if not rights:
+                            rights = [f"0x{ace['access_mask']:08X}"]
+                    else:
+                        if ace_type not in (0x00, 0x05):
+                            continue
+                        rights = check_rights(ace["access_mask"], ace["guid"],
+                                              read_guids=laps_read_guids)
+                        if not rights:
+                            continue
+                    for right in rights:
+                        technique = ATTACK_TECHNIQUES.get(right, {})
+                        severity  = SEVERITY.get(right, "LOW")
+                        results.append({
+                            "right":          right,
+                            "severity":       severity,
+                            "technique":      technique.get("technique", right),
+                            "methods":        technique.get("methods", []),
+                            "attack_vector":  technique.get("attack_vector", ""),
+                            "ace_type":       ace_type,
+                            "ace_type_name":  ACE_TYPE_NAMES.get(ace_type, f"0x{ace_type:02x}"),
+                            "object_name":    obj_name,
+                            "object_dn":      obj_dn,
+                            "object_class":   obj_class,
+                            "access_mask":    ace["access_mask"],
+                            "guid":           ace["guid"],
+                            "inherited":      ace["inherited"],
+                            "verbose_rights": rights_vb,
+                            "trustee":        ace["trustee"],
+                        })
+
+                                                                             
+                                                                  
+                                                                             
+                                                                                
+                                                                               
+                                                                          
+            if "msds-groupmanagedserviceaccount" in obj_class:
+                gmsa_sd_list = entry.get("raw_attributes", {}).get("msDS-GroupMSAMembership", [])
+                if gmsa_sd_list:
+                    gmsa_aces = parse_aces(gmsa_sd_list[0])
+                    for g_ace in gmsa_aces:
+                        if g_ace["trustee"] != target_sid:
+                            continue
+                        if g_ace.get("type") not in (0x00, 0x05):
+                            continue
+                        right     = "ReadGMSAPassword"
+                        technique = ATTACK_TECHNIQUES.get(right, {})
+                        severity  = SEVERITY.get(right, "HIGH")
+                        results.append({
+                            "right":          right,
+                            "severity":       severity,
+                            "technique":      technique.get("technique", right),
+                            "methods":        technique.get("methods", []),
+                            "attack_vector":  technique.get("attack_vector", ""),
+                            "ace_type":       g_ace.get("type"),
+                            "ace_type_name":  ACE_TYPE_NAMES.get(g_ace.get("type"),
+                                                                  f"0x{g_ace.get('type'):02x}"),
+                            "object_name":    obj_name,
+                            "object_dn":      obj_dn,
+                            "object_class":   obj_class,
+                            "access_mask":    g_ace["access_mask"],
+                            "guid":           g_ace.get("guid"),
+                            "inherited":      False,
+                            "verbose_rights": "ReadGMSAPassword (PrincipalsAllowedToRetrieveManagedPassword)",
+                            "trustee":        g_ace["trustee"],
+                        })
         except Exception:
             continue
         if i % 100 == 0 or i == total - 1:
@@ -3518,8 +3678,8 @@ def run_needle_scan(conn, domain_dn: str, page_size: int = 500) -> dict:
                                                                     
                                                                              
     print(f"  {Fore.CYAN}[*] Needle: Checking Windows LAPS (ms-LAPS-EncryptedPassword) ACLs...{Style.RESET_ALL}")
-    WLAPS_GUID = "a6b34bd9-9e1c-4a43-9a6c-2d9a7f9e6a19"                                  
-    WLAPS_GUID2 = "60f5b8f8-aa0c-43ef-b3c4-16e0d9a39c28"                        
+    WLAPS_GUID = WLAPS_PASSWORD_GUID                                          
+    WLAPS_GUID2 = WLAPS_ENCRYPTEDPASSWORD_GUID                      
     try:
         laps_comp_entries = paged_search_all(
             conn, domain_dn,
